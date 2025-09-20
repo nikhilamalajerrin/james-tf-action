@@ -1,14 +1,26 @@
-name: 'Run plancosts'
-description: 'Runs plancosts and outputs table + monthly total'
+name: "Run plancosts"
+description: "Runs plancosts on a Terraform dir (or test JSON) and writes <prefix>-plancosts.txt"
+author: "Nikhil Amala Jerrin J."
+branding:
+  icon: "activity"
+  color: "blue"
+
 inputs:
   file_prefix:
-    description: 'Prefix for output files (e.g. master or pull_request)'
+    description: "Prefix for output file (e.g., base or pr)"
     required: true
+  terraform_dir:
+    description: "Path to Terraform directory to analyze (preferred)"
+    required: false
+    default: ""
+
 outputs:
   monthly_cost:
-    description: 'Extracted monthly cost from table output (OVERALL TOTAL)'
+    description: "Extracted monthly cost from OVERALL TOTAL"
+
 runs:
-  using: 'docker'
-  image: 'Dockerfile'
+  using: "docker"
+  image: "Dockerfile"
   args:
     - ${{ inputs.file_prefix }}
+    - ${{ inputs.terraform_dir }}
