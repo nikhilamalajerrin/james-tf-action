@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Set USE_TFDIR=1 (env) if you enable Terraform in the Dockerfile.
+# Enable real Terraform runs by building TF in the Dockerfile and setting USE_TFDIR=1
 USE_TFDIR="${USE_TFDIR:-0}"
 
 prefix="${1:-run}"
@@ -12,20 +12,51 @@ echo "Using prefix=${prefix}"
 echo "Using terraform_dir=${tfdir_in}"
 echo "Using api_url=${api_url}"
 
-# Price API
+# Price API (initial env)
 if [[ -n "${api_url}" ]]; then
   export PLANCOSTS_API_URL="${api_url}"
   echo "Set PLANCOSTS_API_URL=${PLANCOSTS_API_URL}"
 fi
 
-# (optional) quick readiness log – non-fatal
-if [[ -n "${PLANCOSTS_API_URL:-}" ]]; then
-  echo "Checking price API at ${PLANCOSTS_API_URL}/graphql"
-  code="$(curl -s -o /dev/null -w '%{http_code}' -X POST "${PLANCOSTS_API_URL}/graphql" || true)"
-  echo "API readiness HTTP ${code}"
+# --- Resolve a reachable API base URL from *inside* the container ---
+resolve_api_base() {
+  local try_urls=()
+
+  # If user provided something, try that first
+  if [[ -n "${PLANCOSTS_API_URL:-}" ]]; then
+    try_urls+=("${PLANCOSTS_API_URL}")
+  fi
+
+  # GH Actions Docker on Linux: these are common ways to reach the host
+  local gw
+  gw="$(ip route | awk '/default/ {print $3; exit}')"
+  try_urls+=(
+    "http://host.docker.internal:4000"
+    "http://${gw:-172.17.0.1}:4000"
+    "http://172.17.0.1:4000"
+    "http://127.0.0.1:4000"     # if mock runs in the same container (rare)
+  )
+
+  for u in "${try_urls[@]}"; do
+    local code
+    code="$(curl -s -o /dev/null -w '%{http_code}' -X POST "${u%/}/graphql" || true)"
+    if [[ "$code" = "200" ]]; then
+      echo "$u"
+      return 0
+    fi
+  done
+  echo ""
+}
+
+resolved="$(resolve_api_base)"
+if [[ -n "$resolved" ]]; then
+  export PLANCOSTS_API_URL="$resolved"
+  echo "Price API reachable at: ${PLANCOSTS_API_URL}"
+else
+  echo "WARNING: could not reach any price API endpoint from container; costs will be 0."
 fi
 
-# Single place to build the CLI flag for the price API
+# Build CLI flag once (used for both --tfdir and --tfjson calls)
 API_ARG=()
 if [[ -n "${PLANCOSTS_API_URL:-}" ]]; then
   API_ARG=(--api-url "${PLANCOSTS_API_URL}")
@@ -45,8 +76,9 @@ fi
 
 cd /github/workspace
 echo "Workspace layout:"
-ls -la /github/workspace | sed -n '1,50p'
+ls -la /github/workspace | sed -n '1,80p'
 
+# Choose RUN_DIR that contains the code (prefer PR)
 choose_run_dir() {
   for d in /github/workspace/pr /github/workspace/base /github/workspace ; do
     [[ -d "$d" ]] || continue
@@ -65,6 +97,7 @@ if [[ -z "${RUN_DIR}" ]]; then
 fi
 echo "RUN_DIR=${RUN_DIR}"
 
+# Install deps (pyproject preferred)
 cd "${RUN_DIR}"
 if [[ -f pyproject.toml ]]; then
   echo "[deps] Installing editable from pyproject.toml in ${RUN_DIR}"
@@ -77,6 +110,7 @@ else
   pip install --no-cache-dir click python-dotenv requests boto3 || true
 fi
 
+# Locate CLI entry script
 if [[ -f plancosts/main.py ]]; then
   MAIN_PY="plancosts/main.py"
 elif [[ -f main.py ]]; then
@@ -88,13 +122,14 @@ else
 fi
 echo "MAIN_PY=${MAIN_PY}"
 
+# Sanity help (non-fatal)
 python "${MAIN_PY}" --help >/dev/null 2>&1 || true
 
+# Try --tfdir if enabled and terraform exists
 output=""
 if [[ "${USE_TFDIR}" = "1" && -n "${tfdir:-}" && -d "${tfdir}" && -x "$(command -v terraform)" ]]; then
   echo "Running with --tfdir ${tfdir}"
   set +e
-  # ⬇️ pass API_ARG here
   output="$(python "${MAIN_PY}" "${API_ARG[@]}" --tfdir "${tfdir}" -o table 2>&1)"
   rc=$?
   set -e
@@ -108,6 +143,7 @@ else
   [[ "${USE_TFDIR}" != "1" ]] && echo "USE_TFDIR=0; using --tfjson…"
 fi
 
+# Fallbacks: run against committed plan JSONs (pr -> base -> RUN_DIR)
 try_jsons() {
   local base_dir="$1" out rc
   for f in \
@@ -121,7 +157,6 @@ try_jsons() {
     [[ -f "${base_dir}/${f}" ]] || continue
     echo "Running with --tfjson ${base_dir}/${f}"
     set +e
-    # ⬇️ and pass API_ARG here too
     out="$(python "${MAIN_PY}" "${API_ARG[@]}" --tfjson "${base_dir}/${f}" -o table 2>&1)"
     rc=$?
     set -e
@@ -146,6 +181,7 @@ if [[ -z "${output}" ]]; then
   done
 fi
 
+# Final fallback so downstream steps still run
 if [[ -z "${output}" ]]; then
   output=$'NAME                          HOURLY COST  MONTHLY COST\nno_data                       0.0000       0.0000\nOVERALL TOTAL                 0.0000       0.0000'
 fi
