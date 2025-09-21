@@ -18,6 +18,19 @@ if [[ -n "${api_url}" ]]; then
   echo "Set PLANCOSTS_API_URL=${PLANCOSTS_API_URL}"
 fi
 
+# (optional) quick readiness log – non-fatal
+if [[ -n "${PLANCOSTS_API_URL:-}" ]]; then
+  echo "Checking price API at ${PLANCOSTS_API_URL}/graphql"
+  code="$(curl -s -o /dev/null -w '%{http_code}' -X POST "${PLANCOSTS_API_URL}/graphql" || true)"
+  echo "API readiness HTTP ${code}"
+fi
+
+# Single place to build the CLI flag for the price API
+API_ARG=()
+if [[ -n "${PLANCOSTS_API_URL:-}" ]]; then
+  API_ARG=(--api-url "${PLANCOSTS_API_URL}")
+fi
+
 # Normalize terraform_dir host->container path (agnostic to repo name)
 tfdir="${tfdir_in}"
 if [[ -n "${tfdir}" ]]; then
@@ -34,7 +47,6 @@ cd /github/workspace
 echo "Workspace layout:"
 ls -la /github/workspace | sed -n '1,50p'
 
-# Choose RUN_DIR that contains the code (prefer PR)
 choose_run_dir() {
   for d in /github/workspace/pr /github/workspace/base /github/workspace ; do
     [[ -d "$d" ]] || continue
@@ -53,7 +65,6 @@ if [[ -z "${RUN_DIR}" ]]; then
 fi
 echo "RUN_DIR=${RUN_DIR}"
 
-# Install deps (pyproject preferred); ensure click/dotenv present
 cd "${RUN_DIR}"
 if [[ -f pyproject.toml ]]; then
   echo "[deps] Installing editable from pyproject.toml in ${RUN_DIR}"
@@ -66,7 +77,6 @@ else
   pip install --no-cache-dir click python-dotenv requests boto3 || true
 fi
 
-# Locate CLI entry script
 if [[ -f plancosts/main.py ]]; then
   MAIN_PY="plancosts/main.py"
 elif [[ -f main.py ]]; then
@@ -78,15 +88,14 @@ else
 fi
 echo "MAIN_PY=${MAIN_PY}"
 
-# Sanity help (non-fatal)
 python "${MAIN_PY}" --help >/dev/null 2>&1 || true
 
-# Try --tfdir if enabled and terraform exists
 output=""
 if [[ "${USE_TFDIR}" = "1" && -n "${tfdir:-}" && -d "${tfdir}" && -x "$(command -v terraform)" ]]; then
   echo "Running with --tfdir ${tfdir}"
   set +e
-  output="$(python "${MAIN_PY}" --tfdir "${tfdir}" -o table 2>&1)"
+  # ⬇️ pass API_ARG here
+  output="$(python "${MAIN_PY}" "${API_ARG[@]}" --tfdir "${tfdir}" -o table 2>&1)"
   rc=$?
   set -e
   if [[ $rc -ne 0 ]]; then
@@ -99,7 +108,6 @@ else
   [[ "${USE_TFDIR}" != "1" ]] && echo "USE_TFDIR=0; using --tfjson…"
 fi
 
-# Fallbacks: run against committed plan JSONs (pr -> base -> RUN_DIR)
 try_jsons() {
   local base_dir="$1" out rc
   for f in \
@@ -113,7 +121,8 @@ try_jsons() {
     [[ -f "${base_dir}/${f}" ]] || continue
     echo "Running with --tfjson ${base_dir}/${f}"
     set +e
-    out="$(python "${MAIN_PY}" --tfjson "${base_dir}/${f}" -o table 2>&1)"
+    # ⬇️ and pass API_ARG here too
+    out="$(python "${MAIN_PY}" "${API_ARG[@]}" --tfjson "${base_dir}/${f}" -o table 2>&1)"
     rc=$?
     set -e
     if [[ $rc -eq 0 ]]; then
@@ -137,7 +146,6 @@ if [[ -z "${output}" ]]; then
   done
 fi
 
-# Final fallback so downstream steps still run
 if [[ -z "${output}" ]]; then
   output=$'NAME                          HOURLY COST  MONTHLY COST\nno_data                       0.0000       0.0000\nOVERALL TOTAL                 0.0000       0.0000'
 fi
