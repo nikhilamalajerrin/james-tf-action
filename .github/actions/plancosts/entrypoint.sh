@@ -4,9 +4,9 @@ set -euo pipefail
 # Enable real Terraform runs by building TF in the Dockerfile and setting USE_TFDIR=1
 USE_TFDIR="${USE_TFDIR:-0}"
 
-prefix="${1:-run}"
-tfdir_in="${2:-}"
-api_url="${3:-}"
+prefix="${1:-run}"          # "base" or "pr"
+tfdir_in="${2:-}"           # host path to the TF dir (e.g. /home/runner/.../base/examples/terraform_0_13)
+api_url="${3:-}"            # e.g. http://host.docker.internal:4000
 
 echo "Using prefix=${prefix}"
 echo "Using terraform_dir=${tfdir_in}"
@@ -27,14 +27,14 @@ resolve_api_base() {
     try_urls+=("${PLANCOSTS_API_URL}")
   fi
 
-  # GH Actions Docker on Linux: these are common ways to reach the host
+  # GH Actions Docker on Linux: common ways to reach the host
   local gw
   gw="$(ip route | awk '/default/ {print $3; exit}')"
   try_urls+=(
     "http://host.docker.internal:4000"
     "http://${gw:-172.17.0.1}:4000"
     "http://172.17.0.1:4000"
-    "http://127.0.0.1:4000"     # if mock runs in the same container (rare)
+    "http://127.0.0.1:4000"
   )
 
   for u in "${try_urls[@]}"; do
@@ -53,7 +53,7 @@ if [[ -n "$resolved" ]]; then
   export PLANCOSTS_API_URL="$resolved"
   echo "Price API reachable at: ${PLANCOSTS_API_URL}"
 else
-  echo "WARNING: could not reach any price API endpoint from container; costs will be 0."
+  echo "WARNING: could not reach any price API endpoint from container; costs may be 0."
 fi
 
 # Build CLI flag once (used for both --tfdir and --tfjson calls)
@@ -76,7 +76,7 @@ fi
 
 cd /github/workspace
 echo "Workspace layout:"
-ls -la /github/workspace | sed -n '1,80p'
+ls -la /github/workspace | sed -n '1,120p'
 
 # Choose RUN_DIR that contains the code (prefer PR)
 choose_run_dir() {
@@ -107,7 +107,7 @@ elif [[ -f requirements.txt ]]; then
   pip install --no-cache-dir -r requirements.txt
 else
   echo "[deps] No pyproject/requirements; installing minimal CLI deps"
-  pip install --no-cache-dir click python-dotenv requests boto3 || true
+  pip install --no-cache-dir click requests boto3 || true
 fi
 
 # Locate CLI entry script
@@ -143,12 +143,27 @@ else
   [[ "${USE_TFDIR}" != "1" ]] && echo "USE_TFDIR=0; using --tfjson…"
 fi
 
-# Fallbacks: run against committed plan JSONs (pr -> base -> RUN_DIR)
-try_jsons() {
+# Prefer a plan.json directly under the provided tfdir (even if USE_TFDIR=0)
+if [[ -z "${output}" && -n "${tfdir:-}" && -f "${tfdir}/plan.json" ]]; then
+  echo "Running with --tfjson ${tfdir}/plan.json"
+  set +e
+  tmp_out="$(python "${MAIN_PY}" "${API_ARG[@]}" --tfjson "${tfdir}/plan.json" -o table 2>&1)"
+  rc=$?
+  set -e
+  if [[ $rc -eq 0 ]]; then
+    output="${tmp_out}"
+  else
+    echo "FAILED for ${tfdir}/plan.json (rc=${rc})"
+    echo "${tmp_out}"
+  fi
+fi
+
+# Fallbacks: run against committed plan JSONs (prefix-aware: base first for base, pr first for pr)
+try_jsons_in_dir() {
   local base_dir="$1" out rc
   for f in \
-    "plancosts/examples/terraform_0_13/plan.json" \
     "examples/terraform_0_13/plan.json" \
+    "plancosts/examples/terraform_0_13/plan.json" \
     "plancosts/test_plan_ern.json" \
     "test_plan_ern.json" \
     "plancosts/test_plan.json" \
@@ -172,10 +187,15 @@ try_jsons() {
 }
 
 if [[ -z "${output}" ]]; then
-  for d in /github/workspace/pr /github/workspace/base "${RUN_DIR}"; do
+  if [[ "${prefix}" = "base" ]]; then
+    search_dirs=(/github/workspace/base /github/workspace/pr "${RUN_DIR}")
+  else
+    search_dirs=(/github/workspace/pr /github/workspace/base "${RUN_DIR}")
+  fi
+  for d in "${search_dirs[@]}"; do
     [[ -d "$d" ]] || continue
-    if out="$(try_jsons "$d")"; then
-      output="${out}"
+    if tmp_out="$(try_jsons_in_dir "$d")"; then
+      output="${tmp_out}"
       break
     fi
   done
