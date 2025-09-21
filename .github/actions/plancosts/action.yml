@@ -1,6 +1,6 @@
 name: "Run plancosts"
-description: "Runs plancosts on a Terraform dir (or test JSON) and writes <prefix>-plancosts.txt"
-author: "Nikhil Amala Jerrin J."
+description: "Runs plancosts and writes <prefix>-plancosts.txt"
+author: "You"
 branding:
   icon: "activity"
   color: "blue"
@@ -10,11 +10,11 @@ inputs:
     description: "Prefix for output file (e.g., base or pr)"
     required: true
   terraform_dir:
-    description: "Absolute path to Terraform directory to analyze (preferred)"
+    description: "Absolute path to the Terraform dir (preferred)"
     required: false
     default: ""
   api_url:
-    description: "Price List API base URL (e.g., http://host.docker.internal:4000)"
+    description: "Price API base URL (e.g. http://host.docker.internal:4000)"
     required: false
     default: ""
 

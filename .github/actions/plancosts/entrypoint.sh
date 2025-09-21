@@ -6,98 +6,108 @@ TFDIR_IN="${2:-}"
 API_URL_IN="${3:-}"
 
 echo "=== Starting plancosts action ==="
-echo "Prefix: $PREFIX"
-echo "TFDIR (input): ${TFDIR_IN:-<none>}"
+echo "Prefix: ${PREFIX}"
+echo "TFDIR (input): ${TFDIR_IN}"
+echo "Initial API_URL: ${API_URL_IN:-<empty>}"
 
+# --- If API URL not given, try common gateways (works on GH-hosted runners)
+if [[ -z "${API_URL_IN}" ]]; then
+  for host in host.docker.internal 172.17.0.1 127.0.0.1; do
+    if curl -fsS -m 1 -X POST "http://${host}:4000/graphql" >/dev/null 2>&1; then
+      API_URL_IN="http://${host}:4000"
+      break
+    fi
+  done
+fi
+if [[ -n "${API_URL_IN}" ]]; then
+  echo "Resolved API_URL: ${API_URL_IN}"
+  export PLANCOSTS_API_URL="${API_URL_IN}"
+else
+  echo "WARNING: Price API not reachable; continuing (tests may use static JSON)."
+fi
+
+# --- We run inside the checked-out repo mount
 REPO_ROOT="/github/workspace"
 
-# --- Normalize terraform_dir from host path -> container mount ---
-TFDIR="${TFDIR_IN}"
-if [[ -n "${TFDIR}" && -n "${GITHUB_WORKSPACE:-}" && "${TFDIR}" == "${GITHUB_WORKSPACE}"* ]]; then
-  TFDIR="/github/workspace${TFDIR#${GITHUB_WORKSPACE}}"
-fi
-echo "TFDIR (normalized): ${TFDIR:-<none>}"
-
-# --- API URL: prefer input, then env, then sensible default ---
-API_URL="${API_URL_IN:-${PLANCOSTS_API_URL:-}}"
-if [[ -z "${API_URL}" ]]; then
-  API_URL="http://host.docker.internal:4000"
-fi
-case "${API_URL}" in
-  http://127.0.0.1:*|http://localhost:*)
-    API_URL="http://host.docker.internal:${API_URL##*:}"
-    ;;
-esac
-echo "Initial API_URL: ${API_URL}"
-
-# --- Preflight: if host.docker.internal is not resolvable on this runner, try docker bridge ---
-if ! curl -fsS -X POST "${API_URL%/}/graphql" -o /dev/null >/dev/null 2>&1; then
-  CANDIDATE="http://172.17.0.1:${API_URL##*:}"
-  if curl -fsS -X POST "${CANDIDATE%/}/graphql" -o /dev/null >/dev/null 2>&1; then
-    API_URL="${CANDIDATE}"
-    echo "Switched API_URL to ${API_URL} (docker bridge)"
-  else
-    echo "WARNING: Price API not reachable yet at ${API_URL}."
-  fi
-fi
-
+# Install deps from repo root (pyproject/requirements optional)
 cd "${REPO_ROOT}"
-
-# --- Install deps from repo root if present; else minimal ---
 if [[ -f pyproject.toml ]]; then
+  echo "[deps] Installing from pyproject.toml"
   pip install --no-cache-dir -e .
 elif [[ -f requirements.txt ]]; then
+  echo "[deps] Installing from requirements.txt"
   pip install --no-cache-dir -r requirements.txt
 else
+  echo "[deps] Installing minimal deps"
   pip install --no-cache-dir requests boto3
 fi
 
-# --- Locate main.py in likely places (your tree has pr/plancosts/main.py) ---
+# --- Pick a run dir that has your main.py
 choose_run_dir() {
-  for d in "${REPO_ROOT}/pr" "${REPO_ROOT}/base" "${REPO_ROOT}"; do
-    [[ -f "${d}/plancosts/main.py" || -f "${d}/main.py" ]] && { echo "$d"; return 0; }
+  local candidates=(
+    "${REPO_ROOT}/pr"
+    "${REPO_ROOT}/base"
+    "${REPO_ROOT}"
+  )
+  for d in "${candidates[@]}"; do
+    [[ -f "${d}/main.py" ]] && { echo "${d}"; return; }
+    [[ -f "${d}/plancosts/main.py" ]] && { echo "${d}"; return; }
   done
-  return 1
+  echo ""
 }
-RUN_DIR="$(choose_run_dir || true)"
+
+RUN_DIR="$(choose_run_dir)"
 if [[ -z "${RUN_DIR}" ]]; then
   echo "[warn] main.py not found; writing dummy output"
-  printf "OVERALL TOTAL                 0.00         0.00\n" > "${REPO_ROOT}/${PREFIX}-plancosts.txt"
+  OUT="${REPO_ROOT}/${PREFIX}-plancosts.txt"
+  cat > "${OUT}" <<'EOF'
+NAME                          HOURLY COST  MONTHLY COST
+no_main_py                    0.00         0.00
+OVERALL TOTAL                 0.00         0.00
+EOF
   echo "monthly_cost=0.00" >> "$GITHUB_OUTPUT"
   exit 0
 fi
+
 cd "${RUN_DIR}"
-MAIN_PY=$([[ -f main.py ]] && echo main.py || echo plancosts/main.py)
+if [[ -f main.py ]]; then
+  MAIN_PY="main.py"
+else
+  MAIN_PY="plancosts/main.py"
+fi
 echo "Using run dir: ${RUN_DIR}"
 echo "Using main script: ${MAIN_PY}"
 
-# --- Run plancosts (tfdir preferred; else fallback to test JSONs) ---
+# Normalize TFDIR (runner absolute path works in container since /github/workspace is mounted)
+TFDIR="${TFDIR_IN}"
+
+# Prefer real TF dir, else fallback to known test plans
 output=""
-if [[ -n "${TFDIR:-}" && -d "${TFDIR}" ]]; then
+if [[ -n "${TFDIR}" && -d "${TFDIR}" ]]; then
   echo "Running with --tfdir=${TFDIR}"
   set +e
-  output="$(python "${MAIN_PY}" --tfdir "${TFDIR}" --api-url "${API_URL}" -o table 2>&1)"
+  output="$(python "${MAIN_PY}" --tfdir "${TFDIR}" -o table 2>&1)"
   rc=$?
   set -e
-  if [[ ${rc} -ne 0 ]]; then
-    echo "plancosts --tfdir failed (rc=${rc}); falling back to test JSONs"
-    output=""
-  fi
+  [[ $rc -eq 0 ]] || output=""
 fi
 
 if [[ -z "${output}" ]]; then
-  for f in test_plan_ern.json plancosts/test_plan_ern.json test_plan.json plancosts/test_plan.json; do
+  for f in \
+    plancosts/test_plan_ern.json \
+    test_plan_ern.json \
+    plancosts/test_plan.json \
+    test_plan.json
+  do
     if [[ -f "${f}" ]]; then
       echo "Running with --tfjson ${f}"
-      output="$(python "${MAIN_PY}" --tfjson "${f}" --api-url "${API_URL}" -o table 2>&1)"
+      output="$(python "${MAIN_PY}" --tfjson "${f}" -o table 2>&1)"
       break
     fi
   done
 fi
 
-if [[ -z "${output}" ]]; then
-  output="OVERALL TOTAL                 0.00         0.00"
-fi
+[[ -n "${output}" ]] || output="OVERALL TOTAL                 0.00         0.00"
 
 echo "=== plancosts output ==="
 echo "${output}"
@@ -105,6 +115,7 @@ echo "========================"
 
 OUT="${REPO_ROOT}/${PREFIX}-plancosts.txt"
 echo "${output}" > "${OUT}"
+
 monthly_cost="$(echo "${output}" | awk '/^OVERALL TOTAL/ {print $NF; exit}' 2>/dev/null || echo "0.00")"
 echo "monthly_cost=${monthly_cost}" >> "$GITHUB_OUTPUT"
 echo "Wrote ${OUT}"
