@@ -1,28 +1,31 @@
-name: Run plancosts
-description: Show cloud cost estimate changes from Terraform in pull requests (Infracost-style).
-author: you
+name: "Run plancosts"
+description: "Show cloud cost estimate changes from Terraform in pull requests using plancosts"
+author: "Nikhil Amala Jerrin J."
 branding:
-  icon: trending-up
-  color: blue
+  icon: "activity"
+  color: "blue"
 
 inputs:
-  terraform_dir:
-    description: Path of the Terraform directory (relative to repo root)
+  file_prefix:
+    description: "Prefix for output file (e.g., base or pr)"
     required: true
-  percentage_threshold:
-    description: Absolute % threshold to trigger a commit comment
+  terraform_dir:
+    description: "Path to Terraform directory to analyze"
     required: false
-    default: "0"
+    default: ""
+  api_url:
+    description: "Price API base URL (use host.docker.internal:4000 in CI); no /graphql suffix"
+    required: false
+    default: ""
 
 outputs:
-  master_monthly_cost:
-    description: The base branch monthly cost
-  pull_request_monthly_cost:
-    description: The PR branch monthly cost
+  monthly_cost:
+    description: "Monthly cost estimate from plancosts analysis"
 
 runs:
-  using: docker
-  image: Dockerfile
+  using: "docker"
+  image: "Dockerfile"
   args:
+    - ${{ inputs.file_prefix }}
     - ${{ inputs.terraform_dir }}
-    - ${{ inputs.percentage_threshold }}
+    - ${{ inputs.api_url }}

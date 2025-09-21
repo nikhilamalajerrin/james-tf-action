@@ -1,17 +1,16 @@
 FROM python:3.11-alpine
 
-ARG TF_VERSION=1.6.6
-# Tools needed by script + terraform unzip
-RUN apk --no-cache add bash curl jq git unzip ca-certificates
+# Basics + CRLF fixer
+RUN apk --no-cache add bash curl jq git ca-certificates build-base dos2unix
 
-# Install Terraform
-RUN curl -fsSL "https://releases.hashicorp.com/terraform/${TF_VERSION}/terraform_${TF_VERSION}_linux_amd64.zip" -o /tmp/terraform.zip \
- && unzip /tmp/terraform.zip -d /usr/local/bin \
- && rm -f /tmp/terraform.zip \
- && terraform -version
+# (Optional) enable real Terraform runs by uncommenting this block AND setting USE_TFDIR=1 in entrypoint env.
+# RUN apk --no-cache add wget unzip \
+#   && TERRAFORM_VERSION=1.6.6 \
+#   && wget -O /tmp/terraform.zip "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip" \
+#   && unzip /tmp/terraform.zip -d /usr/local/bin \
+#   && rm -f /tmp/terraform.zip
 
-# Copy entrypoint
 COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+RUN dos2unix /entrypoint.sh && chmod 0755 /entrypoint.sh
 
-ENTRYPOINT ["/entrypoint.sh"]
+ENTRYPOINT ["/bin/bash", "/entrypoint.sh"]
