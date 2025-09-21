@@ -1,146 +1,109 @@
-#!/usr/bin/env bash
+#!/bin/bash
 set -euo pipefail
 
-prefix="${1:-run}"
-tfdir_in="${2:-}"
-api_url="${3:-}"
+terraform_dir="$1"
+percentage_threshold="${2:-0}"
 
-echo "Using prefix=${prefix}"
-echo "Using terraform_dir=${tfdir_in}"
-echo "Using api_url=${api_url}"
+emit_output () { echo "$1=$2" >> "$GITHUB_OUTPUT"; }
 
-# Price API
-if [[ -n "${api_url}" ]]; then
-  export PLANCOSTS_API_URL="${api_url}"
-  echo "Set PLANCOSTS_API_URL=${PLANCOSTS_API_URL}"
-fi
-
-# --- Normalize terraform_dir from host -> container path (generic, no repo name assumed) ---
-tfdir="${tfdir_in}"
-if [[ -n "${tfdir}" ]]; then
-  case "${tfdir}" in
-    */base/*) tfdir="/github/workspace/base/${tfdir##*/base/}" ;;
-    */pr/*)   tfdir="/github/workspace/pr/${tfdir##*/pr/}"   ;;
-    /github/workspace/*) : ;; # already in container space
-    *) echo "WARNING: unexpected terraform_dir format: ${tfdir}" ;;
-  esac
-  echo "Normalized terraform_dir=${tfdir}"
-fi
-
-cd /github/workspace
-echo "Workspace layout:"
-ls -la /github/workspace | sed -n '1,50p'
-
-# --- Pick RUN_DIR that contains the code (prefers PR) ---
-choose_run_dir() {
-  for d in /github/workspace/pr /github/workspace/base /github/workspace ; do
-    [[ -d "$d" ]] || continue
-    if [[ -f "$d/plancosts/main.py" || -f "$d/main.py" ]]; then
-      echo "$d"
-      return 0
-    fi
-  done
-  return 1
-}
-RUN_DIR="$(choose_run_dir || true)"
-if [[ -z "${RUN_DIR}" ]]; then
-  echo "ERROR: No main.py found under pr/, base/, or repo root."
-  echo "monthly_cost=0.00" >> "$GITHUB_OUTPUT"
-  exit 1
-fi
-echo "RUN_DIR=${RUN_DIR}"
-
-# --- Install deps from RUN_DIR root (pyproject preferred) ---
-cd "${RUN_DIR}"
-if [[ -f pyproject.toml ]]; then
-  echo "[deps] Installing editable from pyproject.toml in ${RUN_DIR}"
-  pip install --no-cache-dir -e .
-elif [[ -f requirements.txt ]]; then
-  echo "[deps] Installing from requirements.txt in ${RUN_DIR}"
-  pip install --no-cache-dir -r requirements.txt
-else
-  echo "[deps] No pyproject/requirements in ${RUN_DIR}; installing minimal CLI deps"
-  pip install --no-cache-dir click python-dotenv || true
-fi
-
-# --- Locate main.py in RUN_DIR ---
-if [[ -f plancosts/main.py ]]; then
-  MAIN_PY="plancosts/main.py"
-elif [[ -f main.py ]]; then
-  MAIN_PY="main.py"
-else
-  echo "ERROR: main.py not found in ${RUN_DIR}"
-  echo "monthly_cost=0.00" >> "$GITHUB_OUTPUT"
-  exit 1
-fi
-echo "MAIN_PY=${MAIN_PY}"
-
-# Sanity: show help (non-fatal)
-python "${MAIN_PY}" --help >/dev/null 2>&1 || true
-
-# --- Try --tfdir first ---
-output=""
-if [[ -n "${tfdir:-}" && -d "${tfdir}" ]]; then
-  echo "Running with --tfdir ${tfdir}"
-  set +e
-  output="$(python "${MAIN_PY}" --tfdir "${tfdir}" -o table 2>&1)"
-  rc=$?
-  set -e
-  if [[ $rc -ne 0 ]]; then
-    echo "plancosts --tfdir failed (rc=${rc}); output:"
-    echo "${output}"
-    output=""
+# Prefer PR branch code for your Python package
+install_repo_pkg() {
+  if [ -f "/github/workspace/pull_request/pyproject.toml" ]; then
+    pip install -e "/github/workspace/pull_request"
+  elif [ -f "/github/workspace/pull_request/requirements.txt" ]; then
+    pip install -r "/github/workspace/pull_request/requirements.txt"
+  elif [ -f "/github/workspace/master/pyproject.toml" ]; then
+    pip install -e "/github/workspace/master"
+  elif [ -f "/github/workspace/master/requirements.txt" ]; then
+    pip install -r "/github/workspace/master/requirements.txt"
   fi
-else
-  echo "No usable terraform dir; will try test JSONs…"
+}
+install_repo_pkg
+
+# Pick your main.py
+MAIN_PY=""
+for base in /github/workspace/pull_request /github/workspace/master; do
+  [ -f "$base/plancosts/main.py" ] && MAIN_PY="$base/plancosts/main.py" && break
+  [ -f "$base/main.py" ] && MAIN_PY="$base/main.py" && break
+done
+if [ -z "$MAIN_PY" ]; then
+  echo "ERROR: main.py not found in PR or base."
+  exit 1
 fi
 
-# --- Fallback: look for test plan JSONs in pr/, base/, then RUN_DIR ---
-try_jsons() {
-  local base_dir="$1" out rc
-  for f in plancosts/test_plan_ern.json test_plan_ern.json plancosts/test_plan.json test_plan.json ; do
-    [[ -f "${base_dir}/${f}" ]] || continue
-    echo "Running with --tfjson ${base_dir}/${f}"
-    set +e
-    out="$(python "${MAIN_PY}" --tfjson "${base_dir}/${f}" -o table 2>&1)"
-    rc=$?
-    set -e
-    if [[ $rc -eq 0 ]]; then
-      echo "${out}"
-      return 0
-    else
-      echo "FAILED for ${base_dir}/${f} (rc=${rc})"
-      echo "${out}"
-    fi
-  done
-  return 1
+# Run one side (base/pr) either with existing plan.json or by generating one
+run_side() {
+  local side="$1"   # master | pull_request
+  local out="$2"    # output file
+
+  local tf_dir="/github/workspace/${side}/${terraform_dir%/}"
+  local plan_json="${tf_dir}/plan.json"
+  local gen_json=""
+
+  if [ -f "$plan_json" ]; then
+    echo "[$side] Using existing $plan_json"
+  else
+    echo "[$side] plan.json not found; generating via terraform…"
+    export TF_IN_AUTOMATION=1
+    export TF_INPUT=0
+    (cd "$tf_dir" && terraform init -input=false -lock=false)
+    (cd "$tf_dir" && terraform plan -out tfplan)
+    gen_json="$(mktemp)"
+    (cd "$tf_dir" && terraform show -json tfplan) > "$gen_json"
+    plan_json="$gen_json"
+  fi
+
+  if python "$MAIN_PY" --tfjson "$plan_json" -o table > "$out" 2>&1; then
+    echo "[$side] Wrote $out"
+  else
+    echo "[$side] plancosts failed; output:"
+    cat "$out" || true
+    printf 'NAME  HOURLY COST  MONTHLY COST\nOVERALL TOTAL  0.0000  0.0000\n' > "$out"
+  fi
 }
 
-if [[ -z "${output}" ]]; then
-  for d in /github/workspace/pr /github/workspace/base "${RUN_DIR}"; do
-    [[ -d "$d" ]] || continue
-    if out="$(try_jsons "$d")"; then
-      output="${out}"
-      break
-    fi
-  done
+run_side "master"       master_infracost.txt
+run_side "pull_request" pull_request_infracost.txt
+
+# Extract totals safely
+extract_total () { awk '/OVERALL[[:space:]]+TOTAL/ { last=$NF } END { if (last=="") last=0; printf "%.4f\n", last }' "$1"; }
+master_total="$(extract_total master_infracost.txt)"
+pr_total="$(extract_total pull_request_infracost.txt)"
+
+emit_output master_monthly_cost "$master_total"
+emit_output pull_request_monthly_cost "$pr_total"
+
+# Build diff body
+diff_body="$(git diff --no-color --no-index master_infracost.txt pull_request_infracost.txt | tail -n +3 || true)"
+[ -z "$diff_body" ] && diff_body="No differences detected"
+
+# Calculate % change (avoid div-by-zero)
+abs_pct="0.0"; change_word="increase"
+if awk "BEGIN{exit !($master_total != 0)}"; then
+  pct="$(awk -v o="$master_total" -v n="$pr_total" 'BEGIN{printf "%.4f", (n/o)*100 - 100}')"
+  abs_pct="$(printf "%s" "$pct" | sed 's/^-\(.*\)$/\1/; s/^+//')"
+  if awk "BEGIN{exit !($pct < 0)}"; then change_word="decrease"; fi
 fi
 
-# --- Last resort so downstream steps still run ---
-if [[ -z "${output}" ]]; then
-  output=$'NAME                          HOURLY COST  MONTHLY COST\nno_data                       0.00         0.00\nOVERALL TOTAL                 0.00         0.00'
+# Post commit comment like Infracost if threshold exceeded
+if awk -v a="$abs_pct" -v t="$percentage_threshold" 'BEGIN{exit !(a > t)}'; then
+  body="$(jq -Mnc \
+    --arg word "$change_word" \
+    --arg abs "$abs_pct" \
+    --arg master "$master_total" \
+    --arg pr "$pr_total" \
+    --arg diff "$diff_body" \
+    '{body: ("Monthly cost estimate will " + $word + " by " + $abs + "% (master branch $" + $master + " vs pull request $" + $pr + ")\n<details><summary>plancosts diff</summary>\n\n```diff\n" + $diff + "\n```\n</details>\n")}')"
+
+  curl -sS -L -X POST \
+    -H "Content-Type: application/json" \
+    -H "Authorization: token $GITHUB_TOKEN" \
+    "https://api.github.com/repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/comments" \
+    -d "$body" >/dev/null || echo "WARN: failed to post commit comment"
+else
+  echo "Not posting comment: ${abs_pct}% <= threshold ${percentage_threshold}%"
 fi
 
-echo "=== FINAL PLANCOSTS OUTPUT ==="
-echo "${output}"
-echo "=============================="
-
-# Write artifact at repo root
-OUT="/github/workspace/${prefix}-plancosts.txt"
-echo "${output}" > "${OUT}"
-echo "Wrote ${OUT}"
-
-monthly="$(echo "${output}" | awk '/^OVERALL TOTAL/ {print $NF; exit}')"
-monthly="${monthly:-0.00}"
-echo "monthly_cost=${monthly}" >> "$GITHUB_OUTPUT"
-echo "monthly_cost=${monthly}"
+# Leave artifacts like Infracost
+cp master_infracost.txt /github/workspace/base-plancosts.txt || true
+cp pull_request_infracost.txt /github/workspace/pr-plancosts.txt || true
