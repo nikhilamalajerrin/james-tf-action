@@ -1,121 +1,152 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/sh -l
 
-PREFIX="${1:-run}"
-TFDIR_IN="${2:-}"
-API_URL_IN="${3:-}"
+prefix=$1
+terraform_dir=$2
+api_url=$3
 
-echo "=== Starting plancosts action ==="
-echo "Prefix: ${PREFIX}"
-echo "TFDIR (input): ${TFDIR_IN}"
-echo "Initial API_URL: ${API_URL_IN:-<empty>}"
+echo "Using prefix=$prefix"
+echo "Using terraform_dir=$terraform_dir" 
+echo "Using api_url=$api_url"
 
-# --- If API URL not given, try common gateways (works on GH-hosted runners)
-if [[ -z "${API_URL_IN}" ]]; then
-  for host in host.docker.internal 172.17.0.1 127.0.0.1; do
-    if curl -fsS -m 1 -X POST "http://${host}:4000/graphql" >/dev/null 2>&1; then
-      API_URL_IN="http://${host}:4000"
-      break
+# Set API URL if provided
+if [ -n "$api_url" ]; then
+    export PLANCOSTS_API_URL="$api_url"
+    echo "Set PLANCOSTS_API_URL=$PLANCOSTS_API_URL"
+fi
+
+# Normalize terraform directory path (GitHub workspace -> container path)
+if [ -n "$terraform_dir" ]; then
+    # Convert host path to container path
+    case "$terraform_dir" in
+        /home/runner/work/*/GCPy/base/*)
+            terraform_dir="/github/workspace/base/${terraform_dir##*/base/}"
+            ;;
+        /home/runner/work/*/GCPy/pr/*)
+            terraform_dir="/github/workspace/pr/${terraform_dir##*/pr/}"
+            ;;
+        /github/workspace/*)
+            # Already correct
+            ;;
+        *)
+            echo "WARNING: Unexpected terraform_dir format: $terraform_dir"
+            ;;
+    esac
+    echo "Normalized terraform_dir=$terraform_dir"
+fi
+
+# Working directory and file discovery
+echo "Current working directory: $(pwd)"
+echo "Available directories:"
+ls -la /github/workspace/ 2>/dev/null || echo "No /github/workspace found"
+
+# Check which branch directories exist
+for dir in base pr; do
+    if [ -d "/github/workspace/$dir" ]; then
+        echo "Found branch directory: $dir"
+        echo "Contents of $dir:"
+        ls -la "/github/workspace/$dir" | head -10
     fi
-  done
+done
+if [ -f "plancosts/setup.py" ]; then
+    echo "Installing plancosts package..."
+    cd plancosts
+    pip install -e . || echo "Package install failed"
+    cd /github/workspace
+elif [ -f "plancosts/requirements.txt" ]; then
+    echo "Installing plancosts requirements..."
+    pip install -r plancosts/requirements.txt || echo "Requirements install failed"
 fi
-if [[ -n "${API_URL_IN}" ]]; then
-  echo "Resolved API_URL: ${API_URL_IN}"
-  export PLANCOSTS_API_URL="${API_URL_IN}"
+
+# Find main.py
+if [ -f "plancosts/main.py" ]; then
+    main_script="plancosts/main.py"
+elif [ -f "main.py" ]; then
+    main_script="main.py"
 else
-  echo "WARNING: Price API not reachable; continuing (tests may use static JSON)."
+    echo "ERROR: No main.py found"
+    echo "::set-output name=monthly_cost::0.00"
+    exit 1
 fi
 
-# --- We run inside the checked-out repo mount
-REPO_ROOT="/github/workspace"
+echo "Using script: $main_script"
 
-# Install deps from repo root (pyproject/requirements optional)
-cd "${REPO_ROOT}"
-if [[ -f pyproject.toml ]]; then
-  echo "[deps] Installing from pyproject.toml"
-  pip install --no-cache-dir -e .
-elif [[ -f requirements.txt ]]; then
-  echo "[deps] Installing from requirements.txt"
-  pip install --no-cache-dir -r requirements.txt
-else
-  echo "[deps] Installing minimal deps"
-  pip install --no-cache-dir requests boto3
+# Test the script first (CRITICAL DEBUG STEP)
+echo "Testing script execution..."
+python $main_script --help > test_output.txt 2>&1
+test_exit_code=$?
+echo "Help test exit code: $test_exit_code"
+if [ $test_exit_code -ne 0 ]; then
+    echo "Script help test failed:"
+    cat test_output.txt
 fi
 
-# --- Pick a run dir that has your main.py
-choose_run_dir() {
-  local candidates=(
-    "${REPO_ROOT}/pr"
-    "${REPO_ROOT}/base"
-    "${REPO_ROOT}"
-  )
-  for d in "${candidates[@]}"; do
-    [[ -f "${d}/main.py" ]] && { echo "${d}"; return; }
-    [[ -f "${d}/plancosts/main.py" ]] && { echo "${d}"; return; }
-  done
-  echo ""
-}
+# Try running plancosts (following Infracost pattern exactly)
+echo "Running plancosts analysis..."
 
-RUN_DIR="$(choose_run_dir)"
-if [[ -z "${RUN_DIR}" ]]; then
-  echo "[warn] main.py not found; writing dummy output"
-  OUT="${REPO_ROOT}/${PREFIX}-plancosts.txt"
-  cat > "${OUT}" <<'EOF'
-NAME                          HOURLY COST  MONTHLY COST
-no_main_py                    0.00         0.00
-OVERALL TOTAL                 0.00         0.00
-EOF
-  echo "monthly_cost=0.00" >> "$GITHUB_OUTPUT"
-  exit 0
-fi
-
-cd "${RUN_DIR}"
-if [[ -f main.py ]]; then
-  MAIN_PY="main.py"
-else
-  MAIN_PY="plancosts/main.py"
-fi
-echo "Using run dir: ${RUN_DIR}"
-echo "Using main script: ${MAIN_PY}"
-
-# Normalize TFDIR (runner absolute path works in container since /github/workspace is mounted)
-TFDIR="${TFDIR_IN}"
-
-# Prefer real TF dir, else fallback to known test plans
-output=""
-if [[ -n "${TFDIR}" && -d "${TFDIR}" ]]; then
-  echo "Running with --tfdir=${TFDIR}"
-  set +e
-  output="$(python "${MAIN_PY}" --tfdir "${TFDIR}" -o table 2>&1)"
-  rc=$?
-  set -e
-  [[ $rc -eq 0 ]] || output=""
-fi
-
-if [[ -z "${output}" ]]; then
-  for f in \
-    plancosts/test_plan_ern.json \
-    test_plan_ern.json \
-    plancosts/test_plan.json \
-    test_plan.json
-  do
-    if [[ -f "${f}" ]]; then
-      echo "Running with --tfjson ${f}"
-      output="$(python "${MAIN_PY}" --tfjson "${f}" -o table 2>&1)"
-      break
+if [ -n "$terraform_dir" ] && [ -d "$terraform_dir" ]; then
+    echo "Analyzing terraform directory: $terraform_dir"
+    python $main_script --tfdir $terraform_dir -o table > plancosts_output.txt 2>&1
+    exit_code=$?
+    echo "Terraform analysis exit code: $exit_code"
+    if [ $exit_code -eq 0 ]; then
+        output=$(cat plancosts_output.txt)
+        echo "SUCCESS with terraform directory"
+    else
+        echo "FAILED with terraform directory. Output:"
+        cat plancosts_output.txt
+        output=""
     fi
-  done
+else
+    echo "No terraform directory, trying test JSON..."
+    output=""
 fi
 
-[[ -n "${output}" ]] || output="OVERALL TOTAL                 0.00         0.00"
+# Fallback to test JSON files
+if [ -z "$output" ]; then
+    echo "Trying test JSON files..."
+    for branch in pr base; do
+        for test_file in "plancosts/test_plan_ern.json" "test_plan_ern.json" "plancosts/test_plan.json" "test_plan.json"; do
+            full_test_path="/github/workspace/$branch/$test_file"
+            if [ -f "$full_test_path" ]; then
+                echo "Found test file: $full_test_path"
+                python $main_script --tfjson "$full_test_path" -o table > plancosts_output.txt 2>&1
+                exit_code=$?
+                echo "Test file analysis exit code: $exit_code"
+                if [ $exit_code -eq 0 ]; then
+                    output=$(cat plancosts_output.txt)
+                    echo "SUCCESS with test file: $full_test_path"
+                    break 2
+                else
+                    echo "FAILED with $full_test_path. Output:"
+                    cat plancosts_output.txt
+                fi
+            fi
+        done
+    done
+fi
 
-echo "=== plancosts output ==="
-echo "${output}"
-echo "========================"
+# Final fallback
+if [ -z "$output" ]; then
+    echo "All methods failed. Creating minimal output."
+    output="NAME                          HOURLY COST  MONTHLY COST
+no_data                       0.00         0.00
+OVERALL TOTAL                 0.00         0.00"
+fi
 
-OUT="${REPO_ROOT}/${PREFIX}-plancosts.txt"
-echo "${output}" > "${OUT}"
+echo "=== FINAL PLANCOSTS OUTPUT ==="
+echo "$output"
+echo "=============================="
 
-monthly_cost="$(echo "${output}" | awk '/^OVERALL TOTAL/ {print $NF; exit}' 2>/dev/null || echo "0.00")"
-echo "monthly_cost=${monthly_cost}" >> "$GITHUB_OUTPUT"
-echo "Wrote ${OUT}"
+# Write output file (like Infracost does)
+echo "$output" > ${prefix}-plancosts.txt
+
+# Extract monthly cost (following Infracost pattern exactly)
+monthly_cost=$(echo "$output" | awk '/OVERALL TOTAL/ { print $NF }')
+
+if [ -z "$monthly_cost" ]; then
+    monthly_cost="0.00"
+fi
+
+echo "::set-output name=monthly_cost::$monthly_cost"
+echo "Monthly cost extracted: $monthly_cost"
+echo "Plancosts analysis completed"

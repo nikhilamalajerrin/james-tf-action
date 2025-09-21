@@ -1,8 +1,8 @@
 name: "Run plancosts"
-description: "Runs plancosts and writes <prefix>-plancosts.txt"
-author: "You"
+description: "Show cloud cost estimate changes from Terraform in pull requests using plancosts"
+author: "Nikhil Amala Jerrin J."
 branding:
-  icon: "activity"
+  icon: "activity" 
   color: "blue"
 
 inputs:
@@ -10,17 +10,17 @@ inputs:
     description: "Prefix for output file (e.g., base or pr)"
     required: true
   terraform_dir:
-    description: "Absolute path to the Terraform dir (preferred)"
+    description: "Path to Terraform directory to analyze"
     required: false
     default: ""
   api_url:
-    description: "Price API base URL (e.g. http://host.docker.internal:4000)"
+    description: "URL for plancosts API (use host.docker.internal for localhost)"
     required: false
     default: ""
 
 outputs:
   monthly_cost:
-    description: "Extracted monthly cost from OVERALL TOTAL"
+    description: "Monthly cost estimate from plancosts analysis"
 
 runs:
   using: "docker"
