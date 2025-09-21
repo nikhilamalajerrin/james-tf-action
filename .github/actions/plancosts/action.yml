@@ -10,7 +10,11 @@ inputs:
     description: "Prefix for output file (e.g., base or pr)"
     required: true
   terraform_dir:
-    description: "Path to Terraform directory to analyze (preferred)"
+    description: "Absolute path to Terraform directory to analyze (preferred)"
+    required: false
+    default: ""
+  api_url:
+    description: "Price List API base URL (e.g., http://host.docker.internal:4000)"
     required: false
     default: ""
 
@@ -24,3 +28,4 @@ runs:
   args:
     - ${{ inputs.file_prefix }}
     - ${{ inputs.terraform_dir }}
+    - ${{ inputs.api_url }}
